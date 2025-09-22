@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__/
+*.pt
+models/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.mp4
