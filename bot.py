@@ -2,7 +2,6 @@ import os
 import io
 import logging
 from pathlib import Path
-from collections import defaultdict
 from typing import List, Tuple
 
 import numpy as np
@@ -14,57 +13,75 @@ from aiogram.enums import ChatAction
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, BufferedInputFile, InputMediaPhoto
 
-
+# ---------- логирование ----------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("yolo-aiogram")
 
-# --- конфиг ---
-TELEGRAM_TOKEN = "8496513536:AAF7UxzZnZMOTd9XvaYkQ33PKaigSxZknUY"
-MODEL_PATH = r"C:\Users\hsudnik\PycharmProjects\BOTYOLO\best.pt"
-
-# --- модель (загрузим один раз) ---
-MODEL = YOLO(MODEL_PATH)
-# При наличии GPU:
-# MODEL.to("cuda")
-
-HELP_TEXT = (
-    "Привет! Пришли мне фото — я верну аннотированную картинку.\n"
-    "Можно присылать как *фото*, так и *документ* (jpg/png/webp/bmp).\n"
-    "Команды: /start, /help"
-)
-
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("yolo-aiogram")
-
-# =========================
-# Конфиг
-# =========================
-
+# =========================================================
+# Конфиг из переменных окружения (Heroku Config Vars)
+# =========================================================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CONF = float(os.getenv("YOLO_CONF", "0.40"))
+DEST_GROUP_ID_ENV = os.getenv("DEST_GROUP_ID", "").strip()
+DEST_GROUP_ID = int(DEST_GROUP_ID_ENV) if DEST_GROUP_ID_ENV else None
+GDRIVE_ID = os.getenv("YOLO_GDRIVE_ID", "").strip()
 
-# =========================
-# Загрузка модели
-# =========================
-log.info(f"Загружаю YOLO модель: {MODEL_PATH}")
-MODEL = YOLO(str(MODEL_PATH))
-# Если есть GPU:
-# MODEL.to("cuda")
-DEST_GROUP_ID = '-1002838445249'
 HELP_TEXT = (
-    "Пришлите фото/картинку — бот вернёт аннотированное PNG и сводку по дефектам.\n"
-    f"Порог уверенности: {CONF:.2f} (можно задать через YOLO_CONF)\n"
-    "Поддержка: photo или документ (jpg/png/webp/bmp).\n"
+    "Пришлите фото/картинку — верну аннотированное PNG и сводку по дефектам.\n"
+    f"Порог уверенности: {CONF:.2f} (YOLO_CONF)\n"
+    "Если задан DEST_GROUP_ID — туда уйдут ВСЕ тайлы (RAW + Annotated) и сводка (размер исходника и число тайлов).\n"
     "Команды: /start, /help"
 )
 
-# =========================
-# Тайлинговый инференс (640x640)
-# =========================
-# =========================
-TILE_SIZE = 480         # размер тайла
-TILE_OVERLAP = 0.20     # доля перекрытия
-NMS_IOU = 0.3           # IoU-порог для NMS (после склейки)
-MAX_MEDIA_PER_ALBUM = 10  # Telegram ограничение
+# =========================================================
+# Загрузка модели: Google Drive -> /tmp/model.pt (через gdown)
+# =========================================================
+def _resolve_model_path() -> Path:
+    """
+    1) Если задан YOLO_GDRIVE_ID — скачать в /tmp/model.pt
+    2) Иначе если задан YOLO_MODEL_PATH и файл существует — использовать его
+    3) Иначе попробовать ./models/model.pt (локальная разработка)
+    """
+    # 1) Google Drive (рекомендуется для Heroku)
+    if GDRIVE_ID:
+        dst = Path("/tmp/model.pt")
+        if not dst.exists():
+            log.info("Скачиваю модель с Google Drive (id=%s) -> %s", GDRIVE_ID, dst)
+            import gdown
+            url = f"https://drive.google.com/uc?id={GDRIVE_ID}"
+            # quiet=False, чтобы в логах Heroku было видно прогресс
+            gdown.download(url, str(dst), quiet=False)
+        return dst
+
+    # 2) Явный путь
+    env_path = os.getenv("YOLO_MODEL_PATH")
+    if env_path:
+        p = Path(env_path).expanduser().resolve()
+        if p.exists():
+            return p
+        log.warning("YOLO_MODEL_PATH задан, но файла нет: %s", p)
+
+    # 3) Дефолт для локалки
+    p = (Path(__file__).parent / "models" / "model.pt").resolve()
+    if not p.exists():
+        raise FileNotFoundError(
+            "Не удалось найти веса модели. Задай YOLO_GDRIVE_ID (рекомендуется для Heroku), "
+            "или YOLO_MODEL_PATH, либо положи weights в ./models/model.pt"
+        )
+    return p
+
+MODEL_PATH = _resolve_model_path()
+log.info("Загружаю YOLO модель: %s", MODEL_PATH)
+MODEL = YOLO(str(MODEL_PATH))
+# MODEL.to("cuda")  # на Heroku обычно CPU
+
+# =========================================================
+# Пайплайн: тайлинг (скользящий) + инференс + отправка
+# =========================================================
+TILE_SIZE = 480          # размер тайла
+TILE_OVERLAP = 0.20      # доля перекрытия между тайлами
+NMS_IOU = 0.3            # IoU-порог для NMS (после склейки)
+MAX_MEDIA_PER_ALBUM = 10 # Telegram лимит в одном альбоме
 
 def decode_image_from_bytes(b: bytes) -> np.ndarray:
     arr = np.frombuffer(b, np.uint8)
@@ -132,9 +149,9 @@ def infer_and_render_with_tiles(
 ) -> Tuple[bytes, dict, List[Tuple[bytes, bytes, str]], dict]:
     """
     Возвращает:
-      - annotated_whole_png: аннотированное целое изображение,
-      - summary: словарь по дефектам ({total, per_class, avg_conf}),
-      - tiles_all: список по ВСЕМ тайлам [(raw_tile_png, annotated_tile_png, caption), ...],
+      - annotated_whole_png,
+      - summary: {total, per_class, avg_conf},
+      - tiles_all: [(raw_tile_png, annotated_tile_png, caption), ...] — ВСЕ тайлы,
       - meta: {"H": int, "W": int, "num_tiles": int}
     """
     H, W = img_bgr.shape[:2]
@@ -142,10 +159,7 @@ def infer_and_render_with_tiles(
     ys = _tile_positions(H, TILE_SIZE, TILE_OVERLAP)
     num_tiles = len(xs) * len(ys)
 
-    all_boxes = []
-    all_scores = []
-    all_classes = []
-
+    all_boxes, all_scores, all_classes = [], [], []
     tiles_all: List[Tuple[bytes, bytes, str]] = []
     t_idx = 0
 
@@ -155,9 +169,7 @@ def infer_and_render_with_tiles(
             pad_h = TILE_SIZE - crop.shape[0]
             pad_w = TILE_SIZE - crop.shape[1]
             if pad_h > 0 or pad_w > 0:
-                crop = cv2.copyMakeBorder(
-                    crop, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0)
-                )
+                crop = cv2.copyMakeBorder(crop, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0, 0, 0))
 
             t_idx += 1
 
@@ -165,24 +177,22 @@ def infer_and_render_with_tiles(
             res = MODEL.predict(crop, conf=conf, imgsz=TILE_SIZE, verbose=False)[0]
             boxes = getattr(res, "boxes", None)
 
-            # подготовим версии тайла для группы: RAW и Annotated (даже если боксов нет)
+            # для группы: RAW и Annotated (даже если боксов нет)
             raw_tile_png = _encode_png(crop)
             tile_annotated_bgr = res.plot() if (boxes is not None and len(boxes) > 0) else crop.copy()
             annotated_tile_png = _encode_png(tile_annotated_bgr)
             caption_tile = f"tile#{t_idx} — x={x}, y={y}"
             tiles_all.append((raw_tile_png, annotated_tile_png, caption_tile))
 
-            # перенос детекций в координаты исходника
+            # перенос детекций к исходнику
             if boxes is None or boxes.cls is None or len(boxes) == 0:
                 continue
-
             xyxy = _to_xyxy(boxes.xyxy)
             confs = boxes.conf.detach().cpu().numpy().astype(np.float32)
             cls_ids = boxes.cls.detach().cpu().numpy().astype(np.int32)
 
             xyxy[:, [0, 2]] += x
             xyxy[:, [1, 3]] += y
-
             xyxy[:, 0] = np.clip(xyxy[:, 0], 0, W - 1)
             xyxy[:, 1] = np.clip(xyxy[:, 1], 0, H - 1)
             xyxy[:, 2] = np.clip(xyxy[:, 2], 0, W - 1)
@@ -222,125 +232,8 @@ def infer_and_render_with_tiles(
     _draw_annotations(annotated, kept_boxes, kept_scores, kept_classes, MODEL.names)
     annotated_whole_png = _encode_png(annotated)
 
-    # сводка по дефектам
+    # сводка
     per_class = {}
     for cls_id in np.unique(kept_classes):
         name = MODEL.names.get(int(cls_id), str(int(cls_id)))
         per_class[name] = int((kept_classes == cls_id).sum())
-    avg_conf = float(kept_scores.mean()) if len(kept_scores) else 0.0
-
-    summary = {
-        "total": int(len(kept_boxes)),
-        "per_class": per_class,
-        "avg_conf": avg_conf,
-    }
-    meta = {"H": H, "W": W, "num_tiles": num_tiles}
-    return annotated_whole_png, summary, tiles_all, meta
-
-def build_summary_from_dict(summary: dict) -> str:
-    lines = [f"Найдено дефектов: {summary['total']}"]
-    if summary["per_class"]:
-        for name, cnt in sorted(summary["per_class"].items(), key=lambda kv: -kv[1]):
-            lines.append(f"- {name}: {cnt}")
-    if summary["total"] > 0:
-        lines.append(f"Средняя уверенность: {summary['avg_conf']:.2f}")
-    return "\n".join(lines)
-
-def build_group_meta_text(meta: dict) -> str:
-    return f"Исходное изображение: {meta['W']}×{meta['H']}\nТайлов 640×640: {meta['num_tiles']}"
-
-async def reply_with_annotated(message: Message, png_bytes: bytes, caption: str):
-    await message.bot.send_chat_action(message.chat.id, ChatAction.UPLOAD_PHOTO)
-    photo = BufferedInputFile(png_bytes, filename="annotated.png")
-    await message.reply_photo(photo=photo, caption=caption)
-
-async def send_tiles_album_to_group(bot: Bot, tiles_all: List[Tuple[bytes, bytes, str]], group_id: int, meta_text: str):
-    """
-    Отправляет в группу ВСЕ тайлы (RAW + Annotated), батчами по 10 медиа.
-    Дополнительно шлёт текстовую сводку meta_text.
-    """
-    if not group_id:
-        return
-    if tiles_all:
-        media: List[InputMediaPhoto] = []
-        for idx, (raw_png, ann_png, caption) in enumerate(tiles_all, start=1):
-            media.append(InputMediaPhoto(media=BufferedInputFile(raw_png, filename=f"tile_raw_{idx}.png"),
-                                         caption=f"{caption} — RAW"))
-            media.append(InputMediaPhoto(media=BufferedInputFile(ann_png, filename=f"tile_ann_{idx}.png"),
-                                         caption=f"{caption} — Annotated"))
-
-        for i in range(0, len(media), MAX_MEDIA_PER_ALBUM):
-            chunk = media[i:i+MAX_MEDIA_PER_ALBUM]
-            await bot.send_chat_action(group_id, ChatAction.UPLOAD_PHOTO)
-            await bot.send_media_group(chat_id=group_id, media=chunk)
-
-    # В конце — текстовая сводка по размеру и числу тайлов
-    if meta_text:
-        await bot.send_message(chat_id=group_id, text=meta_text)
-
-# =========================
-# Хендлеры
-# =========================
-async def cmd_start(message: Message):
-    await message.answer(HELP_TEXT, parse_mode="Markdown")
-
-async def cmd_help(message: Message):
-    await message.answer(HELP_TEXT, parse_mode="Markdown")
-
-async def _process_bytes(message: Message, raw_bytes: bytes):
-    img_bgr = decode_image_from_bytes(raw_bytes)
-
-    annotated_png, summary, tiles_all, meta = infer_and_render_with_tiles(img_bgr, conf=CONF)
-
-    # 1) пользователю — целое изображение с подписью
-    caption = build_summary_from_dict(summary)
-    await reply_with_annotated(message, annotated_png, caption=caption)
-
-    # 2) в группу — ВСЕ тайлы (RAW + Annotated) + сводка размера/кол-ва тайлов
-    if DEST_GROUP_ID:
-        try:
-            meta_text = build_group_meta_text(meta)
-            await send_tiles_album_to_group(message.bot, tiles_all, DEST_GROUP_ID, meta_text)
-        except Exception as e:
-            log.exception("Не удалось отправить тайлы в группу: %s", e)
-
-async def on_photo(message: Message):
-    photo = message.photo[-1]
-    file = await message.bot.get_file(photo.file_id)
-    bio = io.BytesIO()
-    await message.bot.download_file(file.file_path, bio)
-    await _process_bytes(message, bio.getvalue())
-
-async def on_document(message: Message):
-    doc = message.document
-    name = (doc.file_name or "").lower()
-    is_image_ext = name.endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))
-    is_image_mime = (doc.mime_type or "").startswith("image/")
-    if is_image_ext or is_image_mime:
-        file = await message.bot.get_file(doc.file_id)
-        bio = io.BytesIO()
-        await message.bot.download_file(file.file_path, bio)
-        await _process_bytes(message, bio.getvalue())
-    else:
-        await message.reply("Пришлите изображение как документ (jpg/png/webp/bmp).")
-
-# =========================
-# Entrypoint
-# =========================
-async def main():
-    if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN пуст. Задай в .env или окружении.")
-    bot = Bot(TELEGRAM_TOKEN)
-    dp = Dispatcher()
-
-    dp.message.register(cmd_start, CommandStart())
-    dp.message.register(cmd_help, Command("help"))
-    dp.message.register(on_photo, F.photo)
-    dp.message.register(on_document, F.document & ~F.via_bot)
-
-    log.info("Бот запущен (polling). Ожидаю сообщения...")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
