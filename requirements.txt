@@ -2,6 +2,5 @@ aiogram>=3.4.0
 ultralytics>=8.3.0
 opencv-python-headless
 numpy
-python-dotenv
 requests
-
+gdown>=5.1.0
