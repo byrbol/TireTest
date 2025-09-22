@@ -237,3 +237,38 @@ def infer_and_render_with_tiles(
     for cls_id in np.unique(kept_classes):
         name = MODEL.names.get(int(cls_id), str(int(cls_id)))
         per_class[name] = int((kept_classes == cls_id).sum())
+
+async def cmd_start(message: Message):
+    await message.answer(HELP_TEXT, parse_mode="Markdown")
+
+async def cmd_help(message: Message):
+    await message.answer(HELP_TEXT, parse_mode="Markdown")
+
+async def on_photo(message: Message):
+    file = await message.bot.get_file(message.photo[-1].file_id)
+    bio = io.BytesIO()
+    await message.bot.download_file(file.file_path, bio)
+    img = decode_image_from_bytes(bio.getvalue())
+    ann, summary, _, meta = infer_and_render_with_tiles(img, conf=CONF)
+    caption = f"Найдено дефектов: {summary['total']}\n{summary['per_class']}\nРазмер: {meta['W']}x{meta['H']}, тайлов: {meta['num_tiles']}"
+    await reply_with_annotated(message, ann, caption)
+
+async def main():
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("TELEGRAM_TOKEN пуст — задай в Config Vars")
+
+    bot = Bot(TELEGRAM_TOKEN)
+    dp = Dispatcher()
+
+    dp.message.register(cmd_start, CommandStart())
+    dp.message.register(cmd_help, Command("help"))
+    dp.message.register(on_photo, F.photo)
+
+    log.info("Бот запущен (polling)...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
+
+
